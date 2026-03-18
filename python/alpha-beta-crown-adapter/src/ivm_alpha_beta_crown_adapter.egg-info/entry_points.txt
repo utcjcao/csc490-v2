@@ -1,0 +1,2 @@
+[console_scripts]
+ivm-alpha-beta-crown = alpha_beta_crown_adapter.main:main

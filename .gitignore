@@ -1,0 +1,15 @@
+target/
+dist/
+build/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+.env
+*.pyc
+*.pyo
+*.pyd
+*.log
+.DS_Store
+

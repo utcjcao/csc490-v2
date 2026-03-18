@@ -1,0 +1,14 @@
+-- Future PostgreSQL migration placeholder.
+-- Current Phase 1 local/dev persistence uses SQLite for the canonical run flow.
+-- When the system outgrows SQLite, create the initial PostgreSQL schema for:
+--   projects
+--   model_lineages
+--   model_versions
+--   property_specs
+--   verifier_profiles
+--   artifact_bundles
+--   change_sets
+--   reuse_plans
+--   verification_runs
+--   counterexamples
+--   audit_runs

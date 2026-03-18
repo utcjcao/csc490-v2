@@ -1,0 +1,11 @@
+[package]
+name = "ivm-blobstore"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+ivm-application = { path = "../application" }
+

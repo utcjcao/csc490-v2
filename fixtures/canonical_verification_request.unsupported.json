@@ -1,0 +1,8 @@
+{
+  "model_storage_uri": "demo://models/canonical-demo.onnx",
+  "model_sha256": "demo-model-sha256",
+  "input_region": "{\"eps\":0.01,\"norm\":\"l2\"}",
+  "output_constraint": "{\"label\":1}",
+  "timeout_seconds": 60,
+  "memory_mb": 1024
+}
