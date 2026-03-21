@@ -7,7 +7,7 @@ Find 3-4 strong reuse optimizations for alpha-beta-CROWN, with measurable speedu
 1. Get stable GPU execution.
 2. Build repeatable benchmark harness.
 3. Lock baseline metrics.
-4. Add one optimization at a time.
+4. Add one doptimization at a time.
 5. Keep only optimizations with status parity and measurable gains.
 
 ## 1) GPU Bring-Up (First 60-90 min)
