@@ -1,0 +1,16 @@
+{
+  "entries": {
+    "8ae2c3cf49f18fb4f8d0b35f40ef1aa459c2cbb6efe064f8d8d2f40683e25a34": {
+      "avg_domains_visited": null,
+      "avg_time_sec": 0.19006013870239258,
+      "branching_method": "kfsb",
+      "created_at": 1774068714.4142444,
+      "entry_id": "8ae2c3cf49f18fb4f8d0b35f40ef1aa459c2cbb6efe064f8d8d2f40683e25a34",
+      "hit_count": 1,
+      "last_used_at": 1774068714.4521713,
+      "model_sig": "c590d8d7bb81f35f22dd7b6dffd6527da1e5e0ba9dfb7b5d34dd7aed328b2c28",
+      "sample_count": 1,
+      "spec_sig": "e1a973643b10546852d6db80bc1c6e5a3098f019a7254f2fa8cb17a727229558"
+    }
+  }
+}
