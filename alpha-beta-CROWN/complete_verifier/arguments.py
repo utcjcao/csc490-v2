@@ -139,6 +139,19 @@ class ConfigHandler:
         self.add_argument("--instance_cache_strict_recompute", action='store_true',
                           help='Enforce strict recomputation mode by disabling refined-bound skip shortcuts when cache is enabled.',
                           hierarchy=h + ["strict_recompute"])
+        self.add_argument("--instance_cache_bounds_reuse", action='store_true',
+                          help='Enable warm-start reuse of cached intermediate bounds/lA across runs.',
+                          hierarchy=h + ["bounds_reuse"])
+        self.add_argument("--instance_cache_bounds_similarity_min", type=float, default=0.9,
+                          help='Minimum similarity score (0-1) to accept cached bounds/lA.',
+                          hierarchy=h + ["bounds_similarity_min"])
+        self.add_argument("--instance_cache_bounds_layers", type=str, default='all',
+                          choices=['all', 'final_only'],
+                          help='Which layers to reuse bounds/lA for.',
+                          hierarchy=h + ["bounds_layers"])
+        self.add_argument("--instance_cache_bounds_include_lA", action='store_true',
+                          help='Include lA tensors in bounds reuse warm start.',
+                          hierarchy=h + ["bounds_include_lA"])
         h = ["general"]
         self.add_argument("--csv_name", type=str, default=None,
                           help='Name of .csv file containing a list of properties to verify (VNN-COMP specific).',
@@ -534,6 +547,20 @@ class ConfigHandler:
         self.add_argument("--decision_thresh", type=float, default=0,
                           help='Decision threshold of lower bounds. When lower bounds are greater than this value, verification is successful. Set to 0 for robustness verification.',
                           hierarchy=h + ["decision_thresh"])
+        h_nogood = ["bab", "nogood_cache"]
+        self.add_argument("--nogood_enabled", action='store_true',
+                          help="Enable heuristic nogood/pruned-split cache for BaB ordering.",
+                          hierarchy=h_nogood + ["enabled"])
+        self.add_argument("--nogood_max_size", type=int, default=2000,
+                          help="Maximum entries in nogood cache.",
+                          hierarchy=h_nogood + ["max_size"])
+        self.add_argument("--nogood_bias", type=float, default=0.5,
+                          help="Bias weight when reordering splits using nogood scores.",
+                          hierarchy=h_nogood + ["bias"])
+        self.add_argument("--nogood_mode", type=str, default="layer_neuron",
+                          choices=["layer_neuron", "layer_neuron_dir"],
+                          help="Nogood cache key granularity.",
+                          hierarchy=h_nogood + ["mode"])
         self.add_argument("--timeout", type=float, default=360,
                           help='Timeout (in second) for verifying one image/property.',
                           hierarchy=h + ["timeout"])

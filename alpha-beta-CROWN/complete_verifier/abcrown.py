@@ -37,9 +37,23 @@ from cuts.cut_utils import terminate_mip_processes
 from lp_test import compare_optimized_bounds_against_lp_bounds
 from cache_utils import (
     InstanceCacheManager,
+    build_instance_meta,
     build_model_signature,
     build_spec_signature,
 )
+
+
+def _to_cpu(obj):
+    if obj is None:
+        return None
+    import torch
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu()
+    if isinstance(obj, dict):
+        return {k: _to_cpu(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_cpu(v) for v in obj]
+    return obj
 
 
 class ABCROWN:
@@ -114,6 +128,7 @@ class ABCROWN:
         cache_cfg = arguments.Config['cache']
         self.cache_manager = InstanceCacheManager()
         self._cached_reference_alphas = None
+        self._cached_bounds = None
         self._cache_model_sig = None
         self._cache_spec_sig = None
         if cache_cfg['enabled'] and cache_cfg['strict_recompute']:
@@ -202,14 +217,17 @@ class ABCROWN:
 
             self.vnnlib_handler = vnnlib_handler
             self._cached_reference_alphas = None
+            self._cached_bounds = None
             self._cache_model_sig = None
             self._cache_spec_sig = None
             bab_args['branching']['candidates'] = base_branching_candidates
+            current_meta = None
             if cache_cfg['enabled']:
                 self._cache_model_sig = build_model_signature()
                 self._cache_spec_sig = build_spec_signature(vnnlib_id, vnnlib_handler=vnnlib_handler)
+                current_meta = build_instance_meta(vnnlib_handler=vnnlib_handler)
                 cache_payload = self.cache_manager.load_for_instance(
-                    self._cache_model_sig, self._cache_spec_sig
+                    self._cache_model_sig, self._cache_spec_sig, current_meta=current_meta
                 )
                 if (
                     cache_cfg['alpha_warmstart']
@@ -226,6 +244,23 @@ class ABCROWN:
                             f'Instance-cache hint: branching candidates {old_c} -> '
                             f'{bab_args["branching"]["candidates"]}'
                         )
+                if cache_cfg.get('bounds_reuse', False) and isinstance(cache_payload, dict):
+                    sim = self.cache_manager.last_similarity_score
+                    sim_thr = float(cache_cfg.get('bounds_similarity_min', 0.9))
+                    if sim is not None and sim >= sim_thr:
+                        bounds_scope = cache_cfg.get('bounds_layers', 'all')
+                        self._cached_bounds = cache_payload.get('bounds', None)
+                        if isinstance(self._cached_bounds, dict) and bounds_scope == 'final_only':
+                            keys = list(self._cached_bounds.keys())
+                            if keys:
+                                last_k = keys[-1]
+                                self._cached_bounds = {last_k: self._cached_bounds[last_k]}
+                        include_lA = cache_cfg.get('bounds_include_lA', False)
+                        if include_lA:
+                            self._cached_lA = cache_payload.get('lA', None)
+                        else:
+                            self._cached_lA = None
+                        print(f'Instance-cache bounds warm start accepted (sim={sim}).')
             # FIXME: Remove adhoc_tuning()
             # [0:1] is an ad-hoc tmp operation to align with the API of other functions
             # eventually, other functions should be updated to use vnnlibHandler
@@ -332,7 +367,7 @@ class ABCROWN:
             # and upper bounds will be reused in bab and mip.
             if (not verified_success and enable_incomplete):
                 verified_status, ret = self.incomplete_verifier(
-                    model_ori, interm_bounds
+                    model_ori, interm_bounds if self._cached_bounds is None else self._cached_bounds
                 )
                 # filter out the attack examples for verified OR specs.
                 self.spec_handler_incomplete: SpecHandler
@@ -360,6 +395,9 @@ class ABCROWN:
                         self._cache_spec_sig,
                         alpha=ret.get('alphas'),
                         branching_method=bab_args['branching']['method'],
+                        meta=current_meta,
+                        bounds=_to_cpu(ret.get('lower_bounds', None)),
+                        lA=_to_cpu(ret.get('lA', None)),
                     )
 
             if not verified_success and arguments.Config['attack']['pgd_order'] == 'after':
@@ -453,6 +491,7 @@ class ABCROWN:
                     domains_visited=domains_visited,
                     branching_method=bab_args['branching']['method'],
                     branching_layer_hist=layer_hist,
+                    meta=current_meta,
                 )
                 if self.cache_manager.last_lookup_hit:
                     cache_status = 'hit-exact' if self.cache_manager.last_lookup_exact else 'hit-model'
