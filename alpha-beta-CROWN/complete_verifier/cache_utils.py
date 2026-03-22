@@ -28,6 +28,24 @@ def _safe_file_id(text: str) -> str:
     return text.replace("/", "_").replace("\\", "_").replace(":", "_")
 
 
+def _safe_mean_abs(tensor_like) -> Optional[float]:
+    if tensor_like is None:
+        return None
+    try:
+        return float(tensor_like.detach().abs().mean().item())
+    except Exception:
+        return None
+
+
+def _safe_std(tensor_like) -> Optional[float]:
+    if tensor_like is None:
+        return None
+    try:
+        return float(tensor_like.detach().float().std().item())
+    except Exception:
+        return None
+
+
 def build_model_signature() -> str:
     model_cfg = arguments.Config["model"]
     general_cfg = arguments.Config["general"]
@@ -85,6 +103,59 @@ def build_spec_signature(vnnlib_id: int, vnnlib_handler=None) -> str:
     return _sha256_text(_stable_json_dumps(payload))
 
 
+def build_instance_meta(vnnlib_handler=None) -> dict[str, Any]:
+    meta: dict[str, Any] = {}
+    if vnnlib_handler is None:
+        return meta
+    c = getattr(vnnlib_handler, "c", None)
+    rhs = getattr(vnnlib_handler, "rhs", None)
+    x = getattr(vnnlib_handler, "x", None)
+    or_spec_size = getattr(vnnlib_handler, "or_spec_size", None)
+    meta.update({
+        "input_shape": getattr(vnnlib_handler, "input_shape", None),
+        "num_output": getattr(vnnlib_handler, "num_output", None),
+        "total_num_or": int(getattr(vnnlib_handler, "total_num_or", 0)),
+        "or_spec_size_sum": int(or_spec_size.sum().item()) if hasattr(or_spec_size, "sum") else None,
+        "c_abs_mean": _safe_mean_abs(c),
+        "c_std": _safe_std(c),
+        "rhs_abs_mean": _safe_mean_abs(rhs),
+        "rhs_std": _safe_std(rhs),
+        "x_abs_mean": _safe_mean_abs(x),
+        "x_std": _safe_std(x),
+    })
+    return meta
+
+
+def _extract_numeric_suffix(name: str) -> int:
+    # Layer names are often like "/41"; keep robust fallback.
+    digits = "".join(ch for ch in name if ch.isdigit())
+    return int(digits) if digits else -1
+
+
+def select_alpha_scope(alpha_payload: Any, scope: str = "all", last_n: int = 1):
+    if not isinstance(alpha_payload, dict):
+        return None
+    if scope == "all":
+        return alpha_payload
+
+    node_names = list(alpha_payload.keys())
+    node_names_sorted = sorted(node_names, key=_extract_numeric_suffix)
+    if not node_names_sorted:
+        return alpha_payload
+
+    if scope == "final_only":
+        keep = set(node_names_sorted[-1:])
+    elif scope == "last2":
+        keep = set(node_names_sorted[-2:])
+    elif scope == "lastn":
+        keep = set(node_names_sorted[-max(1, int(last_n)):])
+    else:
+        keep = set(node_names)
+
+    filtered = {k: v for k, v in alpha_payload.items() if k in keep}
+    return filtered if filtered else alpha_payload
+
+
 @dataclass
 class CacheEntryMeta:
     entry_id: str
@@ -111,6 +182,7 @@ class InstanceCacheManager:
         self._index: dict[str, dict[str, Any]] = {"entries": {}}
         self.last_lookup_hit: bool = False
         self.last_lookup_exact: bool = False
+        self.last_similarity_score: Optional[float] = None
 
         if not self.enabled:
             return
@@ -162,7 +234,45 @@ class InstanceCacheManager:
                     pass
             entries.pop(entry_id, None)
 
-    def _find_best_entry_id(self, model_sig: str, spec_sig: str) -> tuple[Optional[str], bool]:
+    def _similarity_score(self, a: dict[str, Any], b: dict[str, Any]) -> float:
+        score = 0.0
+        weight = 0.0
+
+        def add_rel(k: str, w: float):
+            nonlocal score, weight
+            av = a.get(k, None)
+            bv = b.get(k, None)
+            if av is None or bv is None:
+                return
+            denom = max(abs(float(av)), abs(float(bv)), 1e-6)
+            rel = abs(float(av) - float(bv)) / denom
+            score += max(0.0, 1.0 - rel) * w
+            weight += w
+
+        if a.get("input_shape", None) == b.get("input_shape", None):
+            score += 1.0
+        weight += 1.0
+        if a.get("num_output", None) == b.get("num_output", None):
+            score += 1.0
+        weight += 1.0
+
+        add_rel("total_num_or", 1.0)
+        add_rel("or_spec_size_sum", 1.0)
+        add_rel("c_abs_mean", 2.0)
+        add_rel("c_std", 1.5)
+        add_rel("rhs_abs_mean", 2.0)
+        add_rel("rhs_std", 1.5)
+        add_rel("x_abs_mean", 1.0)
+        add_rel("x_std", 1.0)
+
+        return 0.0 if weight == 0 else float(score / weight)
+
+    def _find_best_entry_id(
+        self,
+        model_sig: str,
+        spec_sig: str,
+        current_meta: Optional[dict[str, Any]] = None,
+    ) -> tuple[Optional[str], bool]:
         entries = self._index.get("entries", {})
         exact = [
             (eid, m) for eid, m in entries.items()
@@ -176,16 +286,36 @@ class InstanceCacheManager:
             if m.get("model_sig") == model_sig
         ]
         if same_model:
+            if current_meta is not None:
+                scored = []
+                for eid, m in same_model:
+                    entry_meta = m.get("meta", {})
+                    s = self._similarity_score(current_meta, entry_meta)
+                    scored.append((eid, m, s))
+                scored.sort(key=lambda t: (t[2], t[1].get("last_used_at", 0.0)), reverse=True)
+                if scored:
+                    self.last_similarity_score = float(scored[0][2])
+                    return scored[0][0], False
             same_model.sort(key=lambda kv: kv[1].get("last_used_at", 0.0), reverse=True)
+            self.last_similarity_score = None
             return same_model[0][0], False
         return None, False
 
-    def load_for_instance(self, model_sig: str, spec_sig: str) -> dict[str, Any]:
+    def load_for_instance(
+        self,
+        model_sig: str,
+        spec_sig: str,
+        *,
+        current_meta: Optional[dict[str, Any]] = None,
+    ) -> dict[str, Any]:
         self.last_lookup_hit = False
         self.last_lookup_exact = False
+        self.last_similarity_score = None
         if not self.enabled:
             return {}
-        entry_id, exact_match = self._find_best_entry_id(model_sig, spec_sig)
+        entry_id, exact_match = self._find_best_entry_id(
+            model_sig, spec_sig, current_meta=current_meta
+        )
         if entry_id is None:
             return {}
         path = self._entry_path(entry_id)
@@ -216,6 +346,7 @@ class InstanceCacheManager:
         domains_visited: Optional[float] = None,
         branching_method: Optional[str] = None,
         branching_layer_hist: Optional[dict[str, int]] = None,
+        meta: Optional[dict[str, Any]] = None,
     ) -> None:
         if not self.enabled:
             return
@@ -269,6 +400,7 @@ class InstanceCacheManager:
             "avg_time_sec": avg_time,
             "avg_domains_visited": avg_dom,
             "branching_method": branching_method or old.get("branching_method"),
+            "meta": meta if isinstance(meta, dict) else old.get("meta", {}),
         }
         self._evict_if_needed()
         self._save_index()

@@ -133,6 +133,16 @@ class ConfigHandler:
         self.add_argument("--instance_cache_alpha_warmstart", action='store_true',
                           help='Enable loading cached alpha tensors as warm-start initialization in incomplete verification.',
                           hierarchy=h + ["alpha_warmstart"])
+        self.add_argument("--instance_cache_alpha_similarity_min", type=float, default=0.85,
+                          help='Minimum similarity score (0-1) for using model-level cached alpha warm starts.',
+                          hierarchy=h + ["alpha_similarity_min"])
+        self.add_argument("--instance_cache_alpha_seed_scope", type=str, default='all',
+                          choices=['all', 'final_only', 'last2', 'lastn'],
+                          help='Scope of cached alpha tensors to seed: all layers or only trailing layers.',
+                          hierarchy=h + ["alpha_seed_scope"])
+        self.add_argument("--instance_cache_alpha_seed_last_n", type=int, default=2,
+                          help='When alpha_seed_scope=lastn, number of trailing alpha layers to seed.',
+                          hierarchy=h + ["alpha_seed_last_n"])
         self.add_argument("--instance_cache_branching_hints", action='store_true',
                           help='Enable simple branching-hint adaptation based on cached prior instance outcomes.',
                           hierarchy=h + ["branching_hints"])

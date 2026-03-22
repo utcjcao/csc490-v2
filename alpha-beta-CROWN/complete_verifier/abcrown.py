@@ -37,8 +37,10 @@ from cuts.cut_utils import terminate_mip_processes
 from lp_test import compare_optimized_bounds_against_lp_bounds
 from cache_utils import (
     InstanceCacheManager,
+    build_instance_meta,
     build_model_signature,
     build_spec_signature,
+    select_alpha_scope,
 )
 
 
@@ -208,15 +210,36 @@ class ABCROWN:
             if cache_cfg['enabled']:
                 self._cache_model_sig = build_model_signature()
                 self._cache_spec_sig = build_spec_signature(vnnlib_id, vnnlib_handler=vnnlib_handler)
+                current_meta = build_instance_meta(vnnlib_handler=vnnlib_handler)
                 cache_payload = self.cache_manager.load_for_instance(
-                    self._cache_model_sig, self._cache_spec_sig
+                    self._cache_model_sig, self._cache_spec_sig, current_meta=current_meta
                 )
                 if (
                     cache_cfg['alpha_warmstart']
-                    and self.cache_manager.last_lookup_exact
                     and isinstance(cache_payload, dict)
                 ):
-                    self._cached_reference_alphas = cache_payload.get('alpha', None)
+                    raw_alpha = cache_payload.get('alpha', None)
+                    allow_alpha = self.cache_manager.last_lookup_exact
+                    if not allow_alpha and self.cache_manager.last_lookup_hit:
+                        sim = self.cache_manager.last_similarity_score
+                        sim_thr = float(cache_cfg.get('alpha_similarity_min', 0.85))
+                        allow_alpha = (sim is not None and sim >= sim_thr)
+                    if allow_alpha and raw_alpha is not None:
+                        seed_scope = cache_cfg.get('alpha_seed_scope', 'all')
+                        seed_last_n = int(cache_cfg.get('alpha_seed_last_n', 2))
+                        self._cached_reference_alphas = select_alpha_scope(
+                            raw_alpha, scope=seed_scope, last_n=seed_last_n
+                        )
+                        seeded_nodes = (
+                            len(self._cached_reference_alphas)
+                            if isinstance(self._cached_reference_alphas, dict) else 0
+                        )
+                        print(
+                            "Instance-cache alpha warm-start enabled: "
+                            f"mode={'exact' if self.cache_manager.last_lookup_exact else 'model'} "
+                            f"sim={self.cache_manager.last_similarity_score} "
+                            f"scope={seed_scope} nodes={seeded_nodes}"
+                        )
                 if cache_cfg['branching_hints']:
                     hint = self.cache_manager.suggest_branching_tuning(self._cache_model_sig)
                     if hint.get('candidates_delta', 0) > 0:
@@ -360,6 +383,7 @@ class ABCROWN:
                         self._cache_spec_sig,
                         alpha=ret.get('alphas'),
                         branching_method=bab_args['branching']['method'],
+                        meta=build_instance_meta(vnnlib_handler=vnnlib_handler),
                     )
 
             if not verified_success and arguments.Config['attack']['pgd_order'] == 'after':
@@ -453,12 +477,16 @@ class ABCROWN:
                     domains_visited=domains_visited,
                     branching_method=bab_args['branching']['method'],
                     branching_layer_hist=layer_hist,
+                    meta=build_instance_meta(vnnlib_handler=vnnlib_handler),
                 )
                 if self.cache_manager.last_lookup_hit:
                     cache_status = 'hit-exact' if self.cache_manager.last_lookup_exact else 'hit-model'
                 else:
                     cache_status = 'miss'
-                print(f'Instance-cache status: {cache_status}')
+                print(
+                    f'Instance-cache status: {cache_status} '
+                    f'(sim={self.cache_manager.last_similarity_score})'
+                )
 
         self.logger.finish()
         return self.logger.verification_summary

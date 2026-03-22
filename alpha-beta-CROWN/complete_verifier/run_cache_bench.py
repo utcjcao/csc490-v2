@@ -54,6 +54,20 @@ def _variant_args(variant: str, cache_path: str) -> List[str]:
             "--instance_cache_path",
             cache_path,
         ]
+    if variant == "cache_alpha_only":
+        return [
+            "--enable_instance_cache",
+            "--instance_cache_alpha_warmstart",
+            "--instance_cache_path",
+            cache_path,
+        ]
+    if variant == "cache_branch_only":
+        return [
+            "--enable_instance_cache",
+            "--instance_cache_branching_hints",
+            "--instance_cache_path",
+            cache_path,
+        ]
     raise ValueError(f"Unknown variant: {variant}")
 
 
@@ -178,7 +192,7 @@ def main() -> int:
     parser.add_argument(
         "--variants",
         default="baseline,cache,cache_strict",
-        help="Comma-separated variants from: baseline,cache,cache_strict",
+        help="Comma-separated variants from: baseline,cache,cache_strict,cache_alpha_only,cache_branch_only",
     )
     parser.add_argument("--cache-path", default=".abcrown_cache_bench", help="Cache dir passed to abcrown.")
     parser.add_argument("--extra-args", default="", help="Extra abcrown CLI args as one quoted string.")
@@ -271,4 +285,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
