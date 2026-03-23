@@ -37,41 +37,6 @@ from prune import prune_alphas
 import arguments
 
 
-def _nogood_key(net, decision, mode="layer_neuron", branching_points=None, idx_in_batch=0):
-    layer_idx, neuron_idx = decision[0], decision[1]
-    layer_name = net.split_nodes[layer_idx].name
-    if mode == "layer_neuron_dir" and branching_points is not None:
-        # direction sign using branching_points if available
-        try:
-            point = branching_points[idx_in_batch]
-            direction = torch.sign(point).item() if torch.is_tensor(point) else 0
-        except Exception:
-            direction = 0
-        return (layer_name, int(neuron_idx), int(direction))
-    return (layer_name, int(neuron_idx))
-
-
-def _nogood_score(key):
-    return NOGOODS.get(key, 0.0)
-
-
-def _nogood_update(cache_cfg, keys, reward):
-    if not cache_cfg.get("enabled", False):
-        return
-    max_size = cache_cfg.get("max_size", 2000)
-    for k in keys:
-        NOGOODS[k] = NOGOODS.get(k, 0.0) + reward
-    # simple eviction: drop smallest if over size
-    if len(NOGOODS) > max_size:
-        sorted_items = sorted(NOGOODS.items(), key=lambda kv: kv[1])
-        drop = len(NOGOODS) - max_size
-        for i in range(drop):
-            del NOGOODS[sorted_items[i][0]]
-
-# Simple nogood cache: key -> score
-NOGOODS = {}
-
-
 def get_split_depth(batch_size, min_batch_size, min_depth):
     # Here we check the length of current domain list.
     # If the domain list is small, we can split more layers.
@@ -87,7 +52,6 @@ def split_domain(net: LiRPANet, domains, d, batch, stats=None,
                  branching_heuristic=None, iter_idx=None):
     solver_args = arguments.Config['solver']
     bab_args = arguments.Config['bab']
-    nogood_cfg = bab_args.get('nogood_cache', {})
     branch_args = bab_args['branching']
     biccos_args = bab_args['cut']['biccos']
     biccos_enable = biccos_args['enabled']
@@ -129,18 +93,6 @@ def split_domain(net: LiRPANet, domains, d, batch, stats=None,
             d, split_depth, method=branch_args['method'],
             branching_candidates=max(branch_args['candidates'], split_depth),
             branching_reduceop=branch_args['reduceop']))
-    # Reorder decisions using nogood cache heuristic
-    if nogood_cfg.get('enabled', False):
-        bias = float(nogood_cfg.get('bias', 0.5))
-        mode = nogood_cfg.get('mode', 'layer_neuron')
-        # bias toward higher score (good-pruning splits)
-        decisions_with_score = []
-        for idx, dec in enumerate(branching_decision):
-            key = _nogood_key(net, dec, mode=mode, branching_points=branching_points, idx_in_batch=idx)
-            score = _nogood_score(key)
-            decisions_with_score.append((dec, score))
-        decisions_with_score.sort(key=lambda t: -t[1]*bias)
-        branching_decision = [t[0] for t in decisions_with_score]
     # Record branching-layer usage frequency for optional cache hints.
     current_idx = arguments.Globals['example_idx']
     layer_hist = arguments.Globals['branching_layer_hist'].setdefault(current_idx, {})
@@ -245,20 +197,6 @@ def split_domain(net: LiRPANet, domains, d, batch, stats=None,
     domains.print()
     stats.timer.add('add')
     del d
-    if nogood_cfg.get('enabled', False):
-        # Reward splits that immediately verified (safe)
-        lb_final = ret['global_lb']
-        if lb_final is not None:
-            verified_mask = stop_func(lb_final)
-            if verified_mask is not None:
-                keys = []
-                mode = nogood_cfg.get('mode', 'layer_neuron')
-                for idx, dec in enumerate(branching_decision):
-                    if verified_mask.flatten()[idx]:
-                        key = _nogood_key(net, dec, mode=mode, branching_points=branching_points, idx_in_batch=idx)
-                        keys.append(key)
-                if keys:
-                    _nogood_update(nogood_cfg, keys, reward=1.0)
     return ret
 
 
