@@ -245,16 +245,16 @@ def split_domain(net: LiRPANet, domains, d, batch, stats=None,
     domains.print()
     stats.timer.add('add')
     del d
-    if nogood_cfg.get('enabled', False) and isinstance(ret, dict) and 'global_lb' in ret:
+    if nogood_cfg.get('enabled', False):
         # Reward splits that immediately verified (safe)
-        lb_final = ret.get('global_lb')
+        lb_final = ret['global_lb']
         if lb_final is not None:
             verified_mask = stop_func(lb_final)
             if verified_mask is not None:
                 keys = []
                 mode = nogood_cfg.get('mode', 'layer_neuron')
                 for idx, dec in enumerate(branching_decision):
-                    if idx < verified_mask.numel() and bool(verified_mask.flatten()[idx]):
+                    if verified_mask.flatten()[idx]:
                         key = _nogood_key(net, dec, mode=mode, branching_points=branching_points, idx_in_batch=idx)
                         keys.append(key)
                 if keys:
