@@ -34,10 +34,10 @@ def build_model_signature() -> str:
     solver_cfg = arguments.Config["solver"]
     bab_cfg = arguments.Config["bab"]
     spec_cfg = arguments.Config["specification"]
+    cache_cfg = arguments.Config["cache"]
+    model_group = cache_cfg.get("model_group", "") or ""
     payload = {
         "name": model_cfg.get("name", ""),
-        "path": model_cfg.get("path", ""),
-        "onnx_path": model_cfg.get("onnx_path", ""),
         "input_shape": model_cfg.get("input_shape", None),
         "device": general_cfg.get("device", ""),
         "complete_verifier": general_cfg.get("complete_verifier", ""),
@@ -46,6 +46,11 @@ def build_model_signature() -> str:
         "epsilon": spec_cfg.get("epsilon", None),
         "branching_method": bab_cfg.get("branching", {}).get("method", ""),
     }
+    if model_group:
+        payload["model_group"] = model_group
+    else:
+        payload["path"] = model_cfg.get("path", "")
+        payload["onnx_path"] = model_cfg.get("onnx_path", "")
     return _sha256_text(_stable_json_dumps(payload))
 
 

@@ -127,6 +127,10 @@ class ConfigHandler:
         self.add_argument("--instance_cache_path", type=str, default='',
                           help='Directory path for persisting instance-cache artifacts and metadata.',
                           hierarchy=h + ["path"])
+        self.add_argument("--instance_cache_model_group", type=str, default='',
+                          help='Optional cache-group identifier that overrides exact checkpoint-path matching. '
+                               'Use this only for controlled experiments that intentionally reuse artifacts across nearby model versions.',
+                          hierarchy=h + ["model_group"])
         self.add_argument("--instance_cache_max_entries", type=int, default=200,
                           help='Maximum number of cache entries retained before evicting oldest entries.',
                           hierarchy=h + ["max_entries"])

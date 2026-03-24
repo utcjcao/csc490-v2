@@ -1,0 +1,20 @@
+general:
+  # The materializer overwrites root_path/csv_name/results_file for each run.
+  root_path: /tmp
+  csv_name: properties.csv
+  results_file: /tmp/m2m_bench_results.txt
+
+model:
+  name: resnet2b
+  # The materializer overwrites this with the source or target checkpoint.
+  path: /tmp/resnet2b.pth
+  input_shape: [-1, 3, 32, 32]
+
+solver:
+  batch_size: 2048
+
+bab:
+  timeout: 120
+
+cache:
+  enabled: false
