@@ -51,6 +51,7 @@ class LPTransformer:
 
         self.relu_constraints_map = {}
         self.last_layer_constrs = None
+        self.last_compute_lb_stats = {}
 
     def build(self, net, prop, relu_mask=None):
         self.create_lp_model(net, prop, relu_mask=relu_mask)
@@ -218,6 +219,9 @@ class LPTransformer:
 
         """
         lb_start_time = time.time()
+        optimized_output_count = 0
+        skipped_nonnegative_output_count = 0
+        lp_solve_time_sec = 0.0
 
         # global_lb is lowest lower bound from all label
         global_lb = None
@@ -228,16 +232,34 @@ class LPTransformer:
             # If previously computed lb >= 0 then we do not need to optimize this
             unsplit_lb = self.lower_bounds[-1][i]
             if unsplit_lb >= 0:
+                skipped_nonnegative_output_count += 1
                 if global_lb is None:
                     global_lb = unsplit_lb
                 continue
 
+            optimized_output_count += 1
+            solve_start_time = time.time()
             adv_ex_candidate, is_feasible = self.optimize_gurobi_model(optimize_var)
+            lp_solve_time_sec += time.time() - solve_start_time
 
             # Immediate return if the LP is not possible
             if not is_feasible:
+                self.last_compute_lb_stats = {
+                    "optimized_output_count": optimized_output_count,
+                    "skipped_nonnegative_output_count": skipped_nonnegative_output_count,
+                    "lp_solve_time_sec": lp_solve_time_sec,
+                    "total_compute_lb_time_sec": time.time() - lb_start_time,
+                    "result": "infeasible",
+                }
                 return None, False, None
             elif nnverify.attack.check_adversarial(adv_ex_candidate, self.net, self.prop):
+                self.last_compute_lb_stats = {
+                    "optimized_output_count": optimized_output_count,
+                    "skipped_nonnegative_output_count": skipped_nonnegative_output_count,
+                    "lp_solve_time_sec": lp_solve_time_sec,
+                    "total_compute_lb_time_sec": time.time() - lb_start_time,
+                    "result": "adversarial_example",
+                }
                 return None, True, adv_ex_candidate
 
             cur_lb = torch.tensor(optimize_var.X)
@@ -248,6 +270,19 @@ class LPTransformer:
             if global_lb is None or cur_lb < global_lb:
                 global_lb = cur_lb
 
+        total_time = time.time() - lb_start_time
+        self.last_compute_lb_stats = {
+            "optimized_output_count": optimized_output_count,
+            "skipped_nonnegative_output_count": skipped_nonnegative_output_count,
+            "lp_solve_time_sec": lp_solve_time_sec,
+            "total_compute_lb_time_sec": total_time,
+            "initial_output_lower_bounds_summary": {
+                "min": float(torch.min(self.lower_bounds[-1]).item()) if len(self.lower_bounds) > 0 else None,
+                "max": float(torch.max(self.lower_bounds[-1]).item()) if len(self.lower_bounds) > 0 else None,
+                "mean": float(torch.mean(self.lower_bounds[-1].float()).item()) if len(self.lower_bounds) > 0 else None,
+            },
+            "result": "ok",
+        }
         config.write_log('Time taken for lb computation: ' + str(time.time() - lb_start_time))
         return global_lb, True, None
 

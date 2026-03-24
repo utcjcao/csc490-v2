@@ -19,7 +19,8 @@ from nnverify.specs.input_spec import merge_input_specs
 
 
 class BnB:
-    def __init__(self, net, transformer, init_prop, args, template_store, print_result=False):
+    def __init__(self, net, transformer, init_prop, args, template_store=None, print_result=False,
+                 artifact_logger=None):
         self.net = net
         self.transformer = transformer
         self.init_prop = init_prop
@@ -30,19 +31,33 @@ class BnB:
         self.init_time = time.time()
         self.global_status = Status.UNKNOWN
         self.print_result = print_result
+        self.artifact_logger = artifact_logger
 
         # Store proof tree for the BnB
-        self.inp_template = self.template_store.get_template(self.init_prop)
+        self.inp_template = self.template_store.get_template(self.init_prop) if self.template_store is not None else None
         self.root_spec = None
         self.proof_tree = None
+        self.root_lb = None
+        self.root_ub = None
 
         self.cur_specs = self.get_init_specs(init_prop)
         self.tree_size = len(self.cur_specs)
         self.prev_lb = None
         self.cur_lb = None
+        self.nodes_visited = 0
+        self.pruned_nodes = 0
+        self.adv_example_nodes = 0
+        self.max_depth_reached = 0
+        self.depth_histogram = {}
+        self.first_k_chosen_splits = []
+        self.first_k_node_lbs = []
+        self.trace_event_index = 0
+        self.iteration_index = 0
+        self.frontier_snapshots = []
+        self.logged_split_effectiveness = set()
 
     def get_init_specs(self, init_prop):
-        tree_avail = self.template_store.is_tree_available(init_prop)
+        tree_avail = self.template_store is not None and self.template_store.is_tree_available(init_prop)
 
         if tree_avail and type(self.args.pt_method) == IVAN:
             proof_tree = self.template_store.get_proof_tree(init_prop)
@@ -57,7 +72,9 @@ class BnB:
 
     def get_unstable_relus(self):
         lb, is_feasible, adv_ex = self.transformer.compute_lb(complete=True)
-        status = self.get_status(adv_ex, is_feasible, lb)
+        self.root_lb = lb
+        self.root_ub = self.get_output_upper_bound()
+        status, _ = self.get_status_details(adv_ex, is_feasible, lb)
 
         if 'unstable_relus' in dir(self.transformer):
             unstable_relus = self.transformer.unstable_relus
@@ -75,13 +92,17 @@ class BnB:
         It is the public method called from the analyzer. @param split is a string that chooses the mode for relu
         or input splitting.
         """
+        split_score = self.set_split_score(self.init_prop, self.cur_specs, inp_template=self.inp_template)
+        self.log_root_artifacts(split_score)
+
         if self.global_status != Status.UNKNOWN:
+            self.log_search_summary()
             return
 
-        split_score = self.set_split_score(self.init_prop, self.cur_specs, inp_template=self.inp_template)
-
         while self.continue_search():
+            self.iteration_index += 1
             self.update_depth()
+            self.record_frontier_snapshot(stage="pre_verify", frontier=self.cur_specs)
 
             self.prev_lb = self.cur_lb
             self.reset_cur_lb()
@@ -92,28 +113,37 @@ class BnB:
             else:
                 self.verify_specs()
 
+            self.record_split_effectiveness()
+            self.record_frontier_snapshot(stage="post_verify", frontier=self.cur_specs)
+
             # Each spec should hold the prev lb and current lb
             self.cur_specs, verified_specs = branch.branch_unsolved(self.cur_specs, self.split, split_score=split_score,
                                                                     inp_template=self.inp_template, args=self.args,
-                                                                    net=self.net, transformer=self.transformer)
+                                                                    net=self.net, transformer=self.transformer,
+                                                                    branch_observer=self.record_split_event,
+                                                                    candidate_limit=self.get_candidate_limit())
             # Update the tree size
             self.tree_size += len(self.cur_specs)
+            self.record_frontier_snapshot(stage="post_branch", frontier=self.cur_specs)
 
         self.check_verified_status()
         self.store_final_tree()
+        self.log_search_summary()
 
     def verify_specs(self):
         for spec in self.cur_specs:
             self.update_transformer(spec.input_spec, relu_spec=spec.relu_spec)
 
             # Transformer is updated with new mask
-            status, lb = self.verify_node(self.transformer, spec.input_spec)
+            status, lb, details = self.verify_node(self.transformer, spec.input_spec)
             self.update_cur_lb(lb)
             spec.update_status(status, lb)
+            self.record_node_result(spec, status, lb, details)
 
             if status == Status.ADV_EXAMPLE or self.is_timeout():
                 self.global_status = status
                 self.store_final_tree()
+                self.log_search_summary()
                 return
 
     def verify_specs_parallel(self):
@@ -126,16 +156,25 @@ class BnB:
             lb, is_feasible, adv_ex = self.transformer.compute_lb(complete=True)
 
             for i in range(len(batch_specs)):
-                status = self.get_status(adv_ex, is_feasible, lb[i])
+                status, reason = self.get_status_details(adv_ex, is_feasible, lb[i])
                 self.update_cur_lb(lb[i])
                 batch_specs[i].update_status(status, lb[i])
+                self.record_node_result(
+                    batch_specs[i],
+                    status,
+                    lb[i],
+                    {"is_feasible": bool(is_feasible), "has_adversarial_example": adv_ex is not None, "reason": reason},
+                )
 
                 if status == Status.ADV_EXAMPLE or self.is_timeout():
                     self.global_status = status
                     self.store_final_tree()
+                    self.log_search_summary()
                     return
 
     def store_final_tree(self):
+        if self.template_store is None:
+            return
         self.proof_tree = ProofTree(self.root_spec)
         self.template_store.add_tree(self.init_prop, self.proof_tree)
 
@@ -146,17 +185,25 @@ class BnB:
         """
         lb, is_feasible, adv_ex = transformer.compute_lb(complete=True)
 
-        status = self.get_status(adv_ex, is_feasible, lb)
-        return status, lb
+        status, reason = self.get_status_details(adv_ex, is_feasible, lb)
+        return status, lb, {"is_feasible": bool(is_feasible), "has_adversarial_example": adv_ex is not None,
+                            "reason": reason}
 
     def get_status(self, adv_ex, is_feasible, lb):
+        status, _ = self.get_status_details(adv_ex, is_feasible, lb)
+        return status
+
+    def get_status_details(self, adv_ex, is_feasible, lb):
         status = Status.UNKNOWN
+        reason = "unknown"
         if adv_ex is not None:
             config.write_log("Found a counter example!")
             status = Status.ADV_EXAMPLE
+            reason = "adversarial_example"
         elif (not is_feasible) or (lb is not None and torch.all(lb >= 0)):
             status = Status.VERIFIED
-        return status
+            reason = "infeasible_pruned" if not is_feasible else "verified_lb_nonnegative"
+        return status, reason
 
     def update_transformer(self, prop, relu_spec=None):
         relu_mask = None
@@ -250,7 +297,7 @@ class BnB:
             split_score = specs.score_relu_esip2(zono_transformer)
 
         # Update the scores based on previous scores
-        if inp_template is not None and split_score is not None:
+        if inp_template is not None and split_score is not None and self.template_store is not None:
             if type(self.args.pt_method) == IVAN or type(self.args.pt_method) == REORDERING:
                 # compute mean worst case improvements
                 observed_split_scores = self.template_store.get_proof_tree(prop).get_observed_split_score()
@@ -263,3 +310,201 @@ class BnB:
                                 observed_split_scores[chosen_split] - thr)
 
         return split_score
+
+    def get_candidate_limit(self):
+        if self.artifact_logger is not None:
+            return self.artifact_logger.top_k_candidates
+        return 5
+
+    def get_output_upper_bound(self):
+        try:
+            if hasattr(self.transformer, "compute_ub"):
+                ub = self.transformer.compute_ub()
+                if isinstance(ub, tuple):
+                    return ub[0]
+                return ub
+            if hasattr(self.transformer, "get_all_bounds"):
+                _, upper_bounds = self.transformer.get_all_bounds()
+                if len(upper_bounds) > 0:
+                    return upper_bounds[-1]
+        except Exception:
+            return None
+        return None
+
+    def log_root_artifacts(self, split_score):
+        if self.artifact_logger is None:
+            return
+
+        unstable_relus = getattr(self.transformer, "unstable_relus", None)
+        root_candidates = []
+        if self.root_spec is not None:
+            root_candidates = branch.get_top_candidates(self.root_spec, self.split, split_score=split_score,
+                                                        limit=self.get_candidate_limit())
+
+        self.artifact_logger.set_root_artifacts(
+            transformer=self.transformer,
+            unstable_relus=unstable_relus,
+            root_lower_bound=self.root_lb,
+            root_upper_bound=self.root_ub,
+            root_candidates=root_candidates,
+        )
+
+    def record_node_result(self, spec, status, lb, details):
+        depth = branch.get_spec_depth(spec)
+        self.nodes_visited += 1
+        self.max_depth_reached = max(self.max_depth_reached, depth)
+        self.depth_histogram[depth] = self.depth_histogram.get(depth, 0) + 1
+
+        if len(self.first_k_node_lbs) < self.get_summary_prefix():
+            self.first_k_node_lbs.append(branch._scalar_lb(lb))
+
+        if status == Status.VERIFIED:
+            self.pruned_nodes += 1
+            self.record_trace_event(
+                {
+                    "event_type": "pruned",
+                    "node_depth": depth,
+                    "node_lower_bound": branch._scalar_lb(lb),
+                    "node_signature": branch.summarize_node_state(spec),
+                    "status": status.name,
+                    "prune_reason": details.get("reason"),
+                }
+            )
+        elif status == Status.ADV_EXAMPLE:
+            self.adv_example_nodes += 1
+            self.record_trace_event(
+                {
+                    "event_type": "adv_example",
+                    "node_depth": depth,
+                    "node_lower_bound": branch._scalar_lb(lb),
+                    "node_signature": branch.summarize_node_state(spec),
+                    "status": status.name,
+                    "prune_reason": details.get("reason"),
+                }
+            )
+
+    def record_split_event(self, event):
+        chosen_split = event.get("chosen_split")
+        if len(self.first_k_chosen_splits) < self.get_summary_prefix():
+            self.first_k_chosen_splits.append(chosen_split)
+        self.record_trace_event({"event_type": "split", "iteration_index": self.iteration_index, **event})
+
+    def record_trace_event(self, event):
+        if self.artifact_logger is None:
+            return
+        self.trace_event_index += 1
+        self.artifact_logger.append_search_event({"event_index": self.trace_event_index, **event})
+
+    def get_summary_prefix(self):
+        if self.artifact_logger is not None:
+            return self.artifact_logger.summary_prefix
+        return 20
+
+    def log_search_summary(self):
+        if self.artifact_logger is None:
+            return
+        self.artifact_logger.set_search_summary(self.get_search_summary())
+
+    def get_search_summary(self):
+        return {
+            "total_nodes_visited": self.nodes_visited,
+            "total_pruned_nodes": self.pruned_nodes,
+            "total_adversarial_nodes": self.adv_example_nodes,
+            "maximum_depth_reached": self.max_depth_reached,
+            "depth_histogram": self.depth_histogram,
+            "first_k_chosen_splits": self.first_k_chosen_splits,
+            "first_k_node_lower_bounds": self.first_k_node_lbs,
+            "frontier_size_at_exit": len(self.cur_specs),
+            "leaf_count": self.count_leaves(),
+            "global_status": self.global_status.name,
+            "frontier_snapshots": self.frontier_snapshots,
+        }
+
+    def count_leaves(self):
+        if self.root_spec is None:
+            return len(self.cur_specs)
+
+        leaves = 0
+        queue = [self.root_spec]
+        while len(queue) != 0:
+            node = queue.pop()
+            if len(node.children) == 0:
+                leaves += 1
+            else:
+                queue.extend(node.children)
+        return leaves
+
+    def record_frontier_snapshot(self, stage, frontier):
+        if len(self.frontier_snapshots) >= self.get_summary_prefix():
+            return
+
+        node_lbs = [branch._scalar_lb(spec.lb) for spec in frontier if spec.lb is not None]
+        scalar_node_lbs = [lb for lb in node_lbs if isinstance(lb, (int, float))]
+        status_counts = {}
+        for spec in frontier:
+            status_counts[spec.status.name] = status_counts.get(spec.status.name, 0) + 1
+
+        snapshot = {
+            "iteration_index": self.iteration_index,
+            "stage": stage,
+            "depth_counter": self.depth,
+            "frontier_size": len(frontier),
+            "status_counts": status_counts,
+            "current_global_lower_bound": branch._scalar_lb(self.cur_lb),
+            "previous_global_lower_bound": branch._scalar_lb(self.prev_lb),
+            "frontier_min_node_lb": min(scalar_node_lbs) if len(scalar_node_lbs) > 0 else None,
+            "frontier_max_node_lb": max(scalar_node_lbs) if len(scalar_node_lbs) > 0 else None,
+        }
+        self.frontier_snapshots.append(snapshot)
+
+    def record_split_effectiveness(self):
+        parent_nodes = []
+        seen = set()
+        for spec in self.cur_specs:
+            parent = spec.parent
+            if parent is None:
+                continue
+            parent_id = id(parent)
+            if parent_id in seen or parent_id in self.logged_split_effectiveness:
+                continue
+            seen.add(parent_id)
+            parent_nodes.append(parent)
+
+        for parent in parent_nodes:
+            if len(parent.children) == 0:
+                continue
+            if any(child.status == Status.UNKNOWN for child in parent.children):
+                continue
+
+            parent_lb = branch._scalar_lb(parent.lb)
+            child_lbs = [branch._scalar_lb(child.lb) for child in parent.children]
+            scalar_child_lbs = [lb for lb in child_lbs if isinstance(lb, (int, float))]
+            min_child_lb = min(scalar_child_lbs) if len(scalar_child_lbs) > 0 else None
+            max_child_lb = max(scalar_child_lbs) if len(scalar_child_lbs) > 0 else None
+            mean_child_lb = sum(scalar_child_lbs) / len(scalar_child_lbs) if len(scalar_child_lbs) > 0 else None
+
+            if isinstance(parent_lb, (int, float)) and min_child_lb is not None:
+                min_improvement = min_child_lb - parent_lb
+                max_improvement = max_child_lb - parent_lb
+                mean_improvement = mean_child_lb - parent_lb
+            else:
+                min_improvement = None
+                max_improvement = None
+                mean_improvement = None
+
+            self.logged_split_effectiveness.add(id(parent))
+            self.record_trace_event(
+                {
+                    "event_type": "split_effectiveness",
+                    "iteration_index": self.iteration_index,
+                    "parent_depth": branch.get_spec_depth(parent),
+                    "parent_signature": branch.summarize_node_state(parent),
+                    "chosen_split": branch.serialize_split_identifier(parent.chosen_split),
+                    "parent_lower_bound": parent_lb,
+                    "child_lower_bounds": child_lbs,
+                    "child_statuses": [child.status.name for child in parent.children],
+                    "min_improvement": min_improvement,
+                    "mean_improvement": mean_improvement,
+                    "max_improvement": max_improvement,
+                }
+            )

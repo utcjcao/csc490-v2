@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import random
 import torch
 
@@ -10,7 +11,8 @@ from nnverify.domains.deepz import ZonoTransformer
 from nnverify.specs.spec import Spec, SpecList
 
 
-def branch_unsolved(spec_list, split, split_score=None, inp_template=None, args=None, net=None, transformer=None):
+def branch_unsolved(spec_list, split, split_score=None, inp_template=None, args=None, net=None, transformer=None,
+                    branch_observer=None, candidate_limit=5):
     new_spec_list = SpecList()
     verified_specs = SpecList()
 
@@ -18,14 +20,16 @@ def branch_unsolved(spec_list, split, split_score=None, inp_template=None, args=
         if spec.status == Status.UNKNOWN:
             add_spec = split_spec(spec, split, split_score=split_score,
                                   inp_template=inp_template,
-                                  args=args, net=net, transformer=transformer)
+                                  args=args, net=net, transformer=transformer,
+                                  branch_observer=branch_observer, candidate_limit=candidate_limit)
             new_spec_list += SpecList(add_spec)
         else:
             verified_specs.append(spec)
     return new_spec_list, verified_specs
 
 
-def split_spec(spec, split_type, split_score=None, inp_template=None, args=None, net=None, transformer=None):
+def split_spec(spec, split_type, split_score=None, inp_template=None, args=None, net=None, transformer=None,
+               branch_observer=None, candidate_limit=5):
     if is_relu_split(split_type):
         spec.chosen_split = choose_relu(split_type, spec.relu_spec, spec=spec, split_score=split_score,
                                         inp_template=inp_template, args=args, transformer=transformer)
@@ -38,7 +42,205 @@ def split_spec(spec, split_type, split_score=None, inp_template=None, args=None,
     else:
         raise ValueError("Unknown split!")
     spec.children += child_specs
+    if branch_observer is not None:
+        branch_observer(
+            {
+                "node_lower_bound": _scalar_lb(spec.lb),
+                "node_depth": get_spec_depth(spec),
+                "node_signature": summarize_node_state(spec),
+                "chosen_split": serialize_split_identifier(spec.chosen_split),
+                "chosen_split_score": get_chosen_split_score(spec.chosen_split, split_score),
+                "top_candidates": get_top_candidates(spec, split_type, split_score=split_score, limit=candidate_limit),
+                "candidate_ranking": get_candidate_ranking_summary(
+                    spec,
+                    split_type,
+                    chosen_split=spec.chosen_split,
+                    split_score=split_score,
+                ),
+                "child_count": len(child_specs),
+            }
+        )
     return child_specs
+
+
+def get_spec_depth(spec):
+    depth = 0
+    cur_spec = spec.parent
+    while cur_spec is not None:
+        depth += 1
+        cur_spec = cur_spec.parent
+    return depth
+
+
+def _scalar_lb(lb):
+    if lb is None:
+        return None
+    if isinstance(lb, torch.Tensor):
+        lb = lb.detach().cpu()
+        if lb.numel() == 1:
+            return float(lb.item())
+        return [float(v) for v in lb.flatten().tolist()]
+    return lb
+
+
+def serialize_split_identifier(split_identifier):
+    if split_identifier is None:
+        return None
+    if isinstance(split_identifier, tuple) and len(split_identifier) == 2:
+        return {"kind": "relu", "layer": int(split_identifier[0]), "neuron": int(split_identifier[1])}
+    return {"kind": "input", "index": int(split_identifier)}
+
+
+def digest_relu_mask(relu_mask):
+    if relu_mask is None:
+        return None
+    digest = hashlib.sha1()
+    for relu_id, decision in sorted(relu_mask.items()):
+        digest.update(str(relu_id).encode("utf-8"))
+        digest.update(str(int(decision)).encode("utf-8"))
+    return digest.hexdigest()[:12]
+
+
+def summarize_relu_mask(relu_mask):
+    if relu_mask is None:
+        return None
+
+    per_layer = {}
+    active = 0
+    passive = 0
+    ambiguous = 0
+    for relu_id, decision in relu_mask.items():
+        layer_idx = int(relu_id[0])
+        stats = per_layer.setdefault(layer_idx, {"layer_index": layer_idx, "active": 0, "passive": 0, "ambiguous": 0})
+        if decision == 1:
+            active += 1
+            stats["active"] += 1
+        elif decision == -1:
+            passive += 1
+            stats["passive"] += 1
+        else:
+            ambiguous += 1
+            stats["ambiguous"] += 1
+
+    return {
+        "mask_digest": digest_relu_mask(relu_mask),
+        "total_relus": len(relu_mask),
+        "assigned_relus": active + passive,
+        "active_relus": active,
+        "passive_relus": passive,
+        "ambiguous_relus": ambiguous,
+        "per_layer": [per_layer[layer_idx] for layer_idx in sorted(per_layer.keys())],
+    }
+
+
+def summarize_input_spec(input_spec):
+    if input_spec is None:
+        return None
+    widths = input_spec.input_ub - input_spec.input_lb
+    widths = widths.detach().cpu().flatten()
+    return {
+        "input_width_digest": hashlib.sha1(widths.numpy().tobytes()).hexdigest()[:12],
+        "input_dim": int(widths.numel()),
+        "max_width": float(torch.max(widths).item()),
+        "mean_width": float(torch.mean(widths.float()).item()),
+        "nonzero_width_dims": int(torch.count_nonzero(widths > 0).item()),
+    }
+
+
+def summarize_node_state(spec):
+    return {
+        "depth": get_spec_depth(spec),
+        "relu_mask": summarize_relu_mask(spec.relu_spec.relu_mask) if spec.relu_spec is not None else None,
+        "input_region": summarize_input_spec(spec.input_spec),
+    }
+
+
+def get_chosen_split_score(chosen_split, split_score):
+    if split_score is None or chosen_split is None:
+        return None
+    score = split_score.get(chosen_split)
+    if score is None:
+        return None
+    if isinstance(score, torch.Tensor):
+        score = score.detach().cpu()
+        if score.numel() == 1:
+            return float(score.item())
+        return [float(v) for v in score.flatten().tolist()]
+    return float(score)
+
+
+def _sortable_score(score):
+    if score is None:
+        return float("-inf")
+    if isinstance(score, list):
+        return score[0] if len(score) > 0 else float("-inf")
+    return float(score)
+
+
+def build_candidate_entries(spec, split_type, split_score=None):
+    if is_relu_split(split_type):
+        relu_mask = spec.relu_spec.relu_mask
+        candidates = []
+        for relu, decision in relu_mask.items():
+            if decision != 0:
+                continue
+            entry = {"split": serialize_split_identifier(relu), "raw_split": relu}
+            if split_score is not None and relu in split_score:
+                score = split_score[relu]
+                if isinstance(score, torch.Tensor):
+                    score = float(score.detach().cpu().item()) if score.numel() == 1 else [
+                        float(v) for v in score.detach().cpu().flatten().tolist()
+                    ]
+                entry["score"] = score
+            else:
+                entry["score"] = None
+            candidates.append(entry)
+        candidates.sort(key=lambda item: _sortable_score(item["score"]), reverse=True)
+        return candidates
+
+    if is_input_split(split_type):
+        widths = spec.input_spec.input_ub - spec.input_spec.input_lb
+        candidates = []
+        for index, value in enumerate(widths.flatten()):
+            candidates.append(
+                {
+                    "split": serialize_split_identifier(index),
+                    "raw_split": index,
+                    "score": float(value.item()),
+                }
+            )
+        candidates.sort(key=lambda item: _sortable_score(item["score"]), reverse=True)
+        return candidates
+
+    return []
+
+
+def get_top_candidates(spec, split_type, split_score=None, limit=5):
+    candidates = build_candidate_entries(spec, split_type, split_score=split_score)
+    return [{"split": candidate["split"], "score": candidate["score"]} for candidate in candidates[:limit]]
+
+
+def get_candidate_ranking_summary(spec, split_type, chosen_split, split_score=None):
+    candidates = build_candidate_entries(spec, split_type, split_score=split_score)
+    if len(candidates) == 0:
+        return {"candidate_count": 0, "chosen_rank": None, "top1_top2_gap": None, "chosen_gap_from_top": None}
+
+    chosen_rank = None
+    chosen_score = None
+    for rank, candidate in enumerate(candidates, start=1):
+        if candidate["raw_split"] == chosen_split:
+            chosen_rank = rank
+            chosen_score = candidate["score"]
+            break
+
+    top_score = candidates[0]["score"]
+    second_score = candidates[1]["score"] if len(candidates) > 1 else None
+    return {
+        "candidate_count": len(candidates),
+        "chosen_rank": chosen_rank,
+        "top1_top2_gap": None if second_score is None else _sortable_score(top_score) - _sortable_score(second_score),
+        "chosen_gap_from_top": None if chosen_score is None else _sortable_score(top_score) - _sortable_score(chosen_score),
+    }
 
 
 def choose_relu(split, relu_spec, spec=None, split_score=None, inp_template=None, args=None, transformer=None):
